@@ -31,6 +31,11 @@ NVIDIA = "https://forums.developer.nvidia.com"
 RPI_FEED = "https://forums.raspberrypi.com/app.php/feed"
 SE = "https://api.stackexchange.com/2.3"
 REDDITS = ["raspberry_pi", "jetson"]
+# 招聘关键词：命中 = 市场在**花钱招**这个能力（价值证据）
+JOB_KEYWORDS = (os.getenv("JOB_KEYWORDS") or
+                "embedded,edge ai,edge device,on-device,firmware,rtos,microcontroller,"
+                "robotics,cuda,tensorrt,jetson,computer vision,smart camera,tinyml,edge inference"
+                ).split(",")
 DEFAULT_QUERIES = ["voice", "speech", "wake word", "voice assistant", "whisper", "asr"]
 NOW = time.time()
 
@@ -45,10 +50,17 @@ PAY_RE = re.compile(
 )
 
 
-def get(url: str, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+def get(url: str, timeout: int = 30, retries: int = 3) -> bytes:
+    last: Exception | None = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:  # noqa: BLE001 - 503/网络抖动：退避重试
+            last = e
+            time.sleep(1.5 * (i + 1))
+    raise last  # type: ignore[misc]
 
 
 def _days(iso: str) -> float:
@@ -132,6 +144,42 @@ def rpi_feed() -> list[dict]:
     return out
 
 
+def remoteok_jobs() -> list[dict]:
+    """RemoteOK：公司在招 = 肯花钱。（其 ToS 要求回链，报告里保留 RemoteOK 链接。）"""
+    data = json.loads(get("https://remoteok.com/api", timeout=40))
+    out = []
+    for j in data:
+        pos = j.get("position")
+        if not pos:
+            continue  # 跳过开头的 legal 条目
+        text = pos.lower()  # 只看职位名，避免 tags 噪音（曾把销售岗匹配成 embedded）
+        hits = [k.strip() for k in JOB_KEYWORDS if k.strip() and k.strip().lower() in text]
+        if hits:
+            out.append({"source": "remoteok", "kind": "job", "term": ",".join(hits),
+                        "title": f"{pos} @ {j.get('company', '?')}", "url": j.get("url") or j.get("apply_url", ""),
+                        "views": 0, "answers": 0, "created": (j.get("date") or "")[:10],
+                        "pay": True, "hits": hits})
+    return out
+
+
+def hn_whoishiring() -> list[dict]:
+    """HN「Who is hiring」当月的招聘评论 → 硬件/嵌入式岗位多，隐私友好、可依赖。"""
+    s = json.loads(get("https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=1"))
+    sid = s["hits"][0]["objectID"]
+    data = json.loads(get(f"https://hn.algolia.com/api/v1/search?tags=comment,story_{sid}&hitsPerPage=1000"))
+    out = []
+    for h in data.get("hits", []):
+        txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", h.get("comment_text") or "")).strip()
+        hits = [k.strip() for k in JOB_KEYWORDS if k.strip() and k.strip().lower() in txt.lower()]
+        if not hits:
+            continue
+        out.append({"source": "hn-hiring", "kind": "job", "term": ",".join(hits),
+                    "title": txt[:130], "url": f"https://news.ycombinator.com/item?id={h['objectID']}",
+                    "views": 0, "answers": 0, "created": (h.get("created_at") or "")[:10],
+                    "pay": True, "hits": hits})
+    return out
+
+
 def reddit_top(sub: str, period: str = "month", limit: int = 50) -> list[dict]:
     url = f"https://www.reddit.com/r/{sub}/top.json?t={period}&limit={limit}"
     data = json.loads(get(url))
@@ -161,37 +209,39 @@ def score(it: dict) -> float:
     return round(base * _recency(days), 1)
 
 
-def collect(queries: list[str] | None) -> tuple[list[dict], list[dict]]:
-    need, community = [], []
-    jobs = []
+def collect(queries: list[str] | None) -> tuple[list[dict], list[dict], list[dict]]:
+    need, community, jobs = [], [], []
+    tasks = []
     if queries:
         for t in queries:
-            jobs += [lambda t=t: nvidia_search(t), lambda t=t: se_raspberrypi(t)]
+            tasks += [lambda t=t: nvidia_search(t), lambda t=t: se_raspberrypi(t)]
     else:
-        jobs += [nvidia_latest, se_raspberrypi, rpi_feed]
-    # 注：Reddit 从机房 IP 常被拒（需 OAuth）；默认不启用，需要时再打开 REDDITS
-    if os.getenv("RADAR_REDDIT") == "1":
-        jobs += [lambda s=s: reddit_top(s) for s in REDDITS]
+        tasks += [nvidia_latest, se_raspberrypi, rpi_feed]
+    if os.getenv("RADAR_REDDIT") == "1":  # 机房 IP 常被拒；默认关
+        tasks += [lambda s=s: reddit_top(s) for s in REDDITS]
+    tasks += [remoteok_jobs, hn_whoishiring]
 
-    for fn in jobs:
+    for fn in tasks:
         try:
             for it in fn():
-                (community if it.get("kind") == "community" else need).append(it)
+                kind = it.get("kind")
+                (jobs if kind == "job" else community if kind == "community" else need).append(it)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] 源失败: {e}")
 
-    def dedup_sort(items):
+    def dedup(items):
         seen, out = set(), []
         for it in items:
-            k = it["url"].split("?")[0]
-            if k not in seen:
-                seen.add(k)
-                it["pay"] = bool(PAY_RE.search(it["title"]))
-                it["score"] = score(it)
-                out.append(it)
-        return sorted(out, key=lambda x: x["score"], reverse=True)
+            k = it["url"]  # 完整 URL（HN 用 ?id=，不能砍 query）
+            if k in seen:
+                continue
+            seen.add(k)
+            it.setdefault("pay", bool(PAY_RE.search(it["title"])))
+            it["score"] = score(it)
+            out.append(it)
+        return sorted(out, key=lambda x: (x.get("created", ""), x["score"]), reverse=True)
 
-    return dedup_sort(need), dedup_sort(community)
+    return dedup(need), dedup(community), dedup(jobs)
 
 
 # ------------------------------------------------------------------ LLM
@@ -232,18 +282,35 @@ def _table(items, rows):
     return lines
 
 
-def write_report(need, community, themes, focus) -> None:
+def write_report(need, community, jobs, themes, focus) -> None:
     pay = [x for x in need if x.get("pay")]
     rest = [x for x in need if not x.get("pay")]
+    # 招聘关键词热度：哪个方向在花钱招人
+    freq: dict[str, int] = {}
+    for j in jobs:
+        for h in j.get("hits", []):
+            freq[h] = freq.get(h, 0) + 1
+    hot = "、".join(f"{k}({v})" for k, v in sorted(freq.items(), key=lambda x: -x[1])[:12]) or "（无）"
+
     L = [f"# 需求雷达：客户最需要什么（{focus or '树莓派 / NVIDIA 生态'}）", "",
          f"生成时间：{datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC · "
-         f"未满足 {len(need)} 条（其中 💰付费意愿 {len(pay)}）· 热议 {len(community)} 条", "",
-         "> 排序 = 未满足度 × 热度 × 新鲜度；**💰 = 标题含「求购/外包/预算/for hire/commercial…」**，加权 ×3（愿意掏钱的才是真需求）。", ""]
+         f"未满足 {len(need)} · 💰标题信号 {len(pay)} · 热议 {len(community)} · **招聘 {len(jobs)}**", "",
+         "> 排序 = 未满足度 × 热度 × 新鲜度；💰 = 标题含「求购/外包/预算/for hire…」。",
+         "> **招聘 = 最硬的「肯花钱」证据**：公司在招什么能力，那个方向就有市场价值。", ""]
     if themes:
         L += ["## 结论（LLM 聚类）", "", themes, "", "---", ""]
-    L += ["## A. 愿意掏钱的需求（💰 最强信号）", ""]
-    L += _table(pay, 20) if pay else ["（本轮无 💰 信号；可换关键词或看 B/C）"]
-    L += ["", "## B. 其他未满足需求（高浏览低回答 / 未回答）", ""] + _table(rest, 20)
+    L += ["## D. 付费市场（招聘 = 肯花钱）", "",
+          f"**热门方向**：{hot}", "",
+          "| 日期 | 岗位 | 命中关键词 |", "|---|---|---|"]
+    for j in jobs[:30]:
+        t = j["title"].replace("|", "\\|")
+        L.append(f"| {j.get('created', '')} | [{t}]({j['url']}) | {j.get('term', '')} |")
+    if not jobs:
+        L.append("| - | （本轮未取到招聘数据） | - |")
+    L += ["", "_招聘数据来源：[RemoteOK](https://remoteok.com)_", "",
+          "## A. 愿意掏钱的需求（💰 标题信号）", ""]
+    L += _table(pay, 15) if pay else ["（本轮无 💰 标题信号；看 D 的招聘证据）"]
+    L += ["", "## B. 其他未满足需求（新近 / 未回答）", ""] + _table(rest, 20)
     L += ["", "## C. 社区热议（高赞 / 多评论）", ""] + _table(community, 15)
     with open("demand.md", "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
@@ -258,8 +325,8 @@ def main() -> None:
 
     queries = args.query or None
     focus = " / ".join(queries) if queries else ""
-    need, community = collect(queries)
-    print(f"未满足 {len(need)} 条 · 热议 {len(community)} 条")
+    need, community, jobs = collect(queries)
+    print(f"未满足 {len(need)} · 热议 {len(community)} · 招聘 {len(jobs)}")
 
     themes = ""
     want_llm = args.llm or os.getenv("RADAR_LLM") == "1"
@@ -268,7 +335,7 @@ def main() -> None:
             themes = llm_cluster((need + community)[: args.top], focus)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] LLM 失败: {e}")
-    write_report(need, community, themes, focus)
+    write_report(need, community, jobs, themes, focus)
     print("写好 demand.md")
 
 
