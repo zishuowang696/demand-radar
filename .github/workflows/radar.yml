@@ -1,0 +1,49 @@
+name: demand-radar
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "关键词（空格分隔；留空=全量抓取）"
+        required: false
+        default: ""
+      llm:
+        description: "用 LLM 聚类（消耗 1 次 DeepSeek 调用）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run demand-radar
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          RADAR_LLM: ${{ inputs.llm && '1' || '0' }}
+        run: |
+          args=""
+          for q in ${{ inputs.query }}; do args="$args --query $q"; done
+          python demand_radar.py $args
+          echo "----- 报告预览 -----"
+          head -40 demand.md
+      - name: Commit report
+        run: |
+          git config user.name "demand-radar-bot"
+          git config user.email "demand-radar-bot@users.noreply.github.com"
+          git add demand.md
+          git diff --staged --quiet || git commit -m "chore: 更新需求雷达报告 $(date -u +%Y-%m-%d)"
+          git push
+      - name: Publish as issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue create --title "需求雷达 $(date -u +%Y-%m-%d)" --body-file demand.md
